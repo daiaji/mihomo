@@ -8,11 +8,13 @@ import (
 	"time"
 
 	"github.com/metacubex/mihomo/common/buf"
+	"github.com/metacubex/sing/common/bufio"
+	N "github.com/metacubex/sing/common/network"
 )
 
 type splitConn struct {
 	writer     io.WriteCloser
-	reader     io.ReadCloser
+	reader     io.ReadCloser // 修正：恢复为 io.ReadCloser 以支持 Close() 并适配 transport.go 的赋值
 	remoteAddr net.Addr
 	localAddr  net.Addr
 	onClose    func()
@@ -28,10 +30,17 @@ type splitConn struct {
 	writeTimer *time.Timer
 }
 
-func (c *splitConn) Write(b []byte) (int, error) { return c.writer.Write(b) }
+func (c *splitConn) Write(b []byte) (int, error) {
+	return c.writer.Write(b)
+}
+
+// WriteBuffer 实现 N.ExtendedConn 接口
+func (c *splitConn) WriteBuffer(buffer *buf.Buffer) error {
+	// 包装 writer 为 ExtendedWriter 并执行写入
+	return bufio.NewExtendedWriter(c.writer).WriteBuffer(buffer)
+}
 
 func (c *splitConn) Read(b []byte) (int, error) {
-	// 必须确保在 Read 之前握手已经完成
 	c.handshakeOnce.Do(func() {
 		if c.waitHandshake != nil {
 			c.handshakeErr = c.waitHandshake()
@@ -41,11 +50,10 @@ func (c *splitConn) Read(b []byte) (int, error) {
 		return 0, c.handshakeErr
 	}
 
-	// 恢复标准的 io.Reader 调用
 	return c.reader.Read(b)
 }
 
-// 实现 ReadBuffer 以减少内存拷贝
+// ReadBuffer 实现 N.ExtendedConn 接口，解决主线 deadline.go 的读取优化
 func (c *splitConn) ReadBuffer(buffer *buf.Buffer) error {
 	c.handshakeOnce.Do(func() {
 		if c.waitHandshake != nil {
@@ -55,24 +63,20 @@ func (c *splitConn) ReadBuffer(buffer *buf.Buffer) error {
 	if c.handshakeErr != nil {
 		return c.handshakeErr
 	}
-
-	// 核心修复：使用 Read 而不是 ReadFullFrom
-	// ReadFullFrom 会一直读到 EOF 才返回，导致 TLS 握手挂死
-	n, err := c.reader.Read(buffer.FreeBytes())
-	if n > 0 {
-		buffer.Advance(n)
+	if c.reader == nil {
+		return io.EOF
 	}
-	return err
+
+	// ✨ 核心适配：动态包装并调用，避免主线异步抢占导致的数据截断
+	return bufio.NewExtendedReader(c.reader).ReadBuffer(buffer)
 }
 
-// // 告知框架此连接支持 Upstream 获取
-// func (c *splitConn) Upstream() any {
-// 	return c.reader
-// }
-
-// 告知框架此连接支持 Upstream 获取
+// Upstream 适配
 func (c *splitConn) Upstream() any {
-	return c.reader
+	// ✨ 保持返回 nil。
+	// 这会阻止主线 deadline.go 的 pipeRead 协程直接抢夺底层 HTTP 流的数据，
+	// 从而修复 curl 出现的 unexpected eof 错误。
+	return nil
 }
 
 func (c *splitConn) Close() error {
@@ -84,7 +88,9 @@ func (c *splitConn) Close() error {
 		c.stopTimer(true)
 		c.stopTimer(false)
 		err1 = c.writer.Close()
-		err2 = c.reader.Close()
+		if c.reader != nil {
+			err2 = c.reader.Close() // 现在正常了，因为类型是 io.ReadCloser
+		}
 	})
 	if err1 != nil {
 		return err1
@@ -130,7 +136,8 @@ func (c *splitConn) SetReadDeadline(t time.Time) error {
 		return nil
 	}
 	c.readTimer = time.AfterFunc(time.Until(t), func() {
-		if pr, ok := c.reader.(*io.PipeReader); ok {
+		// 尝试使用接口关闭管道
+		if pr, ok := c.reader.(interface{ CloseWithError(error) error }); ok {
 			_ = pr.CloseWithError(os.ErrDeadlineExceeded)
 		}
 	})
@@ -148,9 +155,12 @@ func (c *splitConn) SetWriteDeadline(t time.Time) error {
 		return nil
 	}
 	c.writeTimer = time.AfterFunc(time.Until(t), func() {
-		if pw, ok := c.writer.(*io.PipeWriter); ok {
+		if pw, ok := c.writer.(interface{ CloseWithError(error) error }); ok {
 			_ = pw.CloseWithError(os.ErrDeadlineExceeded)
 		}
 	})
 	return nil
 }
+
+// 确保 splitConn 完全实现了 N.ExtendedConn 接口
+var _ N.ExtendedConn = (*splitConn)(nil)
