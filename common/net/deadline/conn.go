@@ -2,11 +2,11 @@ package deadline
 
 import (
 	"net"
+	"os"
 	"time"
 
 	"github.com/metacubex/mihomo/common/atomic"
 
-	// Import sing common
 	"github.com/metacubex/sing/common/buf"
 	"github.com/metacubex/sing/common/bufio"
 	"github.com/metacubex/sing/common/network"
@@ -33,7 +33,6 @@ func IsConn(conn any) bool {
 
 func NewConn(conn net.Conn) *Conn {
 	c := &Conn{
-		// 换回 bufio 提供的实现，这是目前唯一能通过编译且支持接口的方式
 		ExtendedConn: bufio.NewExtendedConn(conn),
 		pipeDeadline: MakePipeDeadline(),
 		resultCh:     make(chan *connReadResult, 1),
@@ -43,9 +42,38 @@ func NewConn(conn net.Conn) *Conn {
 }
 
 func (c *Conn) Read(p []byte) (n int, err error) {
-	// 彻底废弃补丁中的 resultCh 和 pipeRead 逻辑
-	// 恢复为最基础的同步读取
-	return c.ExtendedConn.Read(p)
+	select {
+	case result := <-c.resultCh:
+		if result != nil {
+			n = copy(p, result.buffer)
+			err = result.err
+			if n >= len(result.buffer) {
+				c.resultCh <- nil // finish cache read
+			} else {
+				result.buffer = result.buffer[n:]
+				c.resultCh <- result // push back for next call
+			}
+			return
+		} else {
+			c.resultCh <- nil
+			break
+		}
+	case <-c.pipeDeadline.Wait():
+		return 0, os.ErrDeadlineExceeded
+	}
+
+	if c.disablePipe.Load() {
+		return c.ExtendedConn.Read(p)
+	} else if c.deadline.Load().IsZero() {
+		c.inRead.Store(true)
+		defer c.inRead.Store(false)
+		return c.ExtendedConn.Read(p)
+	}
+
+	<-c.resultCh
+	go c.pipeRead(len(p))
+
+	return c.Read(p)
 }
 
 func (c *Conn) pipeRead(size int) {
@@ -59,7 +87,39 @@ func (c *Conn) pipeRead(size int) {
 }
 
 func (c *Conn) ReadBuffer(buffer *buf.Buffer) (err error) {
-	return c.ExtendedConn.ReadBuffer(buffer)
+	select {
+	case result := <-c.resultCh:
+		if result != nil {
+			n, _ := buffer.Write(result.buffer)
+			err = result.err
+
+			if n >= len(result.buffer) {
+				c.resultCh <- nil // finish cache read
+			} else {
+				result.buffer = result.buffer[n:]
+				c.resultCh <- result // push back for next call
+			}
+			return
+		} else {
+			c.resultCh <- nil
+			break
+		}
+	case <-c.pipeDeadline.Wait():
+		return os.ErrDeadlineExceeded
+	}
+
+	if c.disablePipe.Load() {
+		return c.ExtendedConn.ReadBuffer(buffer)
+	} else if c.deadline.Load().IsZero() {
+		c.inRead.Store(true)
+		defer c.inRead.Store(false)
+		return c.ExtendedConn.ReadBuffer(buffer)
+	}
+
+	<-c.resultCh
+	go c.pipeRead(buffer.FreeLen())
+
+	return c.ReadBuffer(buffer)
 }
 
 func (c *Conn) SetReadDeadline(t time.Time) error {
@@ -74,16 +134,25 @@ func (c *Conn) SetReadDeadline(t time.Time) error {
 	return nil
 }
 
-// 顺便清理一下这个方法，防止它返回错误的缓存状态
 func (c *Conn) ReaderReplaceable() bool {
-	return true
+	select {
+	case result := <-c.resultCh:
+		c.resultCh <- result
+		if result != nil {
+			return false // cache reading
+		} else {
+			break
+		}
+	default:
+		return false // pipe reading
+	}
+	return c.disablePipe.Load() || c.deadline.Load().IsZero()
 }
 
 func (c *Conn) WriterReplaceable() bool {
 	return true
 }
 
-// 修正：Upstream 必须返回 nil，严禁泄露底层流
 func (c *Conn) Upstream() any {
 	return c.ExtendedConn
 }
