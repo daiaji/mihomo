@@ -6,8 +6,6 @@ import (
 	"os"
 	"sync"
 	"time"
-
-	"github.com/metacubex/mihomo/common/buf"
 )
 
 type splitConn struct {
@@ -31,7 +29,7 @@ type splitConn struct {
 func (c *splitConn) Write(b []byte) (int, error) { return c.writer.Write(b) }
 
 func (c *splitConn) Read(b []byte) (int, error) {
-	// 简化握手逻辑，依赖外层 Deadline 即可
+	// 必须确保在 Read 之前握手已经完成
 	c.handshakeOnce.Do(func() {
 		if c.waitHandshake != nil {
 			c.handshakeErr = c.waitHandshake()
@@ -40,27 +38,38 @@ func (c *splitConn) Read(b []byte) (int, error) {
 	if c.handshakeErr != nil {
 		return 0, c.handshakeErr
 	}
+
+	// 恢复标准的 io.Reader 调用
 	return c.reader.Read(b)
 }
 
 // 实现 ReadBuffer 以减少内存拷贝
-func (c *splitConn) ReadBuffer(buffer *buf.Buffer) error {
-	c.handshakeOnce.Do(func() {
-		if c.waitHandshake != nil {
-			c.handshakeErr = c.waitHandshake()
-		}
-	})
-	if c.handshakeErr != nil {
-		return c.handshakeErr
-	}
-	_, err := buffer.ReadFullFrom(c.reader, buffer.FreeLen())
-	return err
-}
+// func (c *splitConn) ReadBuffer(buffer *buf.Buffer) error {
+// 	c.handshakeOnce.Do(func() {
+// 		if c.waitHandshake != nil {
+// 			c.handshakeErr = c.waitHandshake()
+// 		}
+// 	})
+// 	if c.handshakeErr != nil {
+// 		return c.handshakeErr
+// 	}
+// 	if c.reader == nil {
+// 		return io.EOF
+// 	}
 
-// 告知框架此连接支持 Upstream 获取
-func (c *splitConn) Upstream() any {
-	return c.reader
-}
+// 	// 核心修复：使用 Read 而不是 ReadFullFrom
+// 	// ReadFullFrom 会一直读到 EOF 才返回，导致 TLS 握手挂死
+// 	n, err := c.reader.Read(buffer.FreeBytes())
+// 	if n > 0 {
+// 		buffer.Advance(n)
+// 	}
+// 	return err
+// }
+
+// // 告知框架此连接支持 Upstream 获取
+// func (c *splitConn) Upstream() any {
+// 	return c.reader
+// }
 
 func (c *splitConn) Close() error {
 	var err1, err2 error

@@ -216,28 +216,28 @@ func New(config LC.TrojanServer, tunnel C.Tunnel, additions ...inbound.Addition)
 			})
 		}
 
-        go func() {
-            // 1. 判断是否真的需要启动 HTTP 栈 (WS, SplitHTTP 或 gRPC)
-            // 如果 Handler 为 nil，说明是纯 Raw TCP 协议（测试中的 raw 模式）
-            if srv.Handler != nil {
-                _ = srv.Serve(l)
-                return
-            }
+		go func() {
+			// 1. 判断是否真的需要启动 HTTP 栈 (WS, SplitHTTP 或 gRPC)
+			// 如果 Handler 为 nil，说明是纯 Raw TCP 协议（测试中的 raw 模式）
+			if srv.Handler != nil {
+				_ = srv.Serve(l)
+				return
+			}
 
-            // 2. 如果是纯 TCP (Trojan 流)，走原始 Accept 循环
-            for {
-                c, err := l.Accept()
-                if err != nil {
-                    if sl.closed {
-                        break
-                    }
-                    continue
-                }
+			// 2. 如果是纯 TCP (Trojan 流)，走原始 Accept 循环
+			for {
+				c, err := l.Accept()
+				if err != nil {
+					if sl.closed {
+						break
+					}
+					continue
+				}
 
-                // ⚠️ 必须传入 additions，否则测试框架无法识别这个入站
-                go sl.HandleConn(c, tunnel, additions...) 
-            }
-        }()
+				// ⚠️ 必须传入 additions，否则测试框架无法识别这个入站
+				go sl.HandleConn(c, tunnel, additions...)
+			}
+		}()
 	}
 
 	return sl, nil
@@ -267,7 +267,6 @@ func (l *Listener) AddrList() (addrList []net.Addr) {
 }
 
 func (l *Listener) HandleConn(conn net.Conn, tunnel C.Tunnel, additions ...inbound.Addition) {
-	defer conn.Close()
 
 	if l.pickCipher != nil {
 		conn = l.pickCipher.StreamConn(conn)

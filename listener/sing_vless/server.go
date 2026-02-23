@@ -218,25 +218,29 @@ func New(config LC.VlessServer, tunnel C.Tunnel, additions ...inbound.Addition) 
 			})
 		}
 
-        go func() {
-            // 只有显式开启了传输层（WS/SplitHTTP/gRPC）才允许 HTTP 栈介入
-            if srv.Handler != nil {
-                _ = srv.Serve(l)
-                return
-            }
+		go func() {
+			// 只有当 Handler 存在（说明开启了 WS, gRPC 或 XHTTP）时，才尝试使用 HTTP Server
+			if srv.Handler != nil {
+				// 如果是 XHTTP 或 gRPC 路径，srv.Serve 会处理
+				// 注意：如果运行到这里报错，说明你的监听器可能同时收到了 Raw TCP 流量
+				_ = srv.Serve(l)
+				return
+			}
 
-            // 原始 TCP 路径：严禁 HTTP 栈读取任何字节
-            for {
-                c, err := l.Accept()
-                if err != nil {
-                    if sl.closed { break }
-                    continue
-                }
+			// 原始 TCP 路径（测试中的 raw 模式会走这里）
+			for {
+				c, err := l.Accept()
+				if err != nil {
+					if sl.closed {
+						break
+					}
+					continue
+				}
+				// 确保 additions 被传递，否则测试无法匹配用户
+				go sl.HandleConn(c, tunnel, additions...)
+			}
+		}()
 
-                // ⚠️ 必须回传 additions，这是测试通过的基石
-                go sl.HandleConn(c, tunnel, additions...) 
-            }
-        }()
 	}
 
 	return sl, nil
