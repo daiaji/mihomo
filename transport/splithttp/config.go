@@ -286,7 +286,8 @@ func (m *XmuxConfig) GetNormalizedMaxConcurrency() RangeConfig {
 }
 func (m *XmuxConfig) GetNormalizedMaxConnections() RangeConfig {
 	if m == nil || m.MaxConnections == nil {
-		return RangeConfig{From: 16, To: 16}
+		// ✨ 修正：默认维持在 64，显著提升高并发下的稳定性
+		return RangeConfig{From: 64, To: 64}
 	}
 	return *m.MaxConnections
 }

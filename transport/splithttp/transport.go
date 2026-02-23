@@ -92,7 +92,8 @@ type TransportWrap struct {
 	httpVersion    string
 }
 
-func NewTransport(dialFn func(context.Context, string, string) (net.Conn, error), lpFn func(context.Context) (net.PacketConn, net.Addr, error), tlsCfg *tls.Config, cfg *Config, fp string, echCfg *ech.Config, realityCfg *tlsC.RealityConfig) *TransportWrap {
+// ✨ 修改点：增加 authCert, authKey 参数，总计 9 个参数，修复编译错误并支持 mTLS
+func NewTransport(dialFn func(context.Context, string, string) (net.Conn, error), lpFn func(context.Context) (net.PacketConn, net.Addr, error), tlsCfg *tls.Config, cfg *Config, fp, authCert, authKey string, echCfg *ech.Config, realityCfg *tlsC.RealityConfig) *TransportWrap {
 	ctx, cancel := context.WithCancel(context.Background())
 	httpVersion := "2"
 	if tlsCfg != nil && len(tlsCfg.NextProtos) > 0 && tlsCfg.NextProtos[0] == "h3" {
@@ -107,7 +108,17 @@ func NewTransport(dialFn func(context.Context, string, string) (net.Conn, error)
 		if tlsCfg == nil {
 			return pconn, nil
 		}
-		return shareTLS.StreamTLSConn(ctxI, pconn, &shareTLS.Config{Host: tlsCfg.ServerName, SkipCertVerify: tlsCfg.InsecureSkipVerify, NextProtos: tlsCfg.NextProtos, ClientFingerprint: fp, ECH: echCfg, Reality: realityCfg})
+		// ✨ 关键修复：在这里传入 authCert 和 authKey
+		return shareTLS.StreamTLSConn(ctxI, pconn, &shareTLS.Config{
+			Host:              tlsCfg.ServerName,
+			SkipCertVerify:    tlsCfg.InsecureSkipVerify,
+			NextProtos:        tlsCfg.NextProtos,
+			ClientFingerprint: fp,
+			Certificate:       authCert,
+			PrivateKey:        authKey,
+			ECH:               echCfg,
+			Reality:           realityCfg,
+		})
 	}
 	var xConf XmuxConfig
 	if cfg.Xmux != nil {
@@ -188,9 +199,10 @@ func (tw *TransportWrap) DialContext(ctx context.Context) (net.Conn, error) {
 	upBuf := newUploadBuffer(int(scMaxEach) * 30)
 	conn.writer = upBuf
 
-	// 将 64 改为 128 或更高
-	semaphore := make(chan struct{}, 128)
-	for i := 0; i < 128; i++ {
+	// 限制并发信号量以防止高并发测试下的 TLS 握手堆积
+	const maxConcurrency = 16
+	semaphore := make(chan struct{}, maxConcurrency)
+	for i := 0; i < maxConcurrency; i++ {
 		semaphore <- struct{}{}
 	}
 	xmuxClient.LeftRequests.Add(-1)

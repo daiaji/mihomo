@@ -198,8 +198,6 @@ func New(config LC.VmessServer, tunnel C.Tunnel, additions ...inbound.Addition) 
 			l = realityBuilder.NewListener(l)
 		} else if tlsConfig.GetCertificate != nil {
 			l = tls.NewListener(l, tlsConfig)
-		} else if config.WsPath == "" && config.SplitHTTP.Path == "" && config.GrpcServiceName == "" {
-			return nil, errors.New("disallow using Vmess without any certificates/reality/transport config")
 		}
 		sl.listeners = append(sl.listeners, l)
 

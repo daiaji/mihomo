@@ -120,6 +120,9 @@ func (v *Vmess) StreamConnContext(ctx context.Context, c net.Conn, metadata *C.M
 			ClientFingerprint:        v.option.ClientFingerprint,
 			ECHConfig:                v.echConfig,
 			Headers:                  http.Header{},
+			// ✨ 修复：WebSocket 传入证书以支持 mTLS
+			Certificate: v.option.Certificate,
+			PrivateKey:  v.option.PrivateKey,
 		}
 
 		if len(v.option.WSOpts.Headers) != 0 {
@@ -159,6 +162,8 @@ func (v *Vmess) StreamConnContext(ctx context.Context, c net.Conn, metadata *C.M
 				Host:              host,
 				SkipCertVerify:    v.option.SkipCertVerify,
 				ClientFingerprint: v.option.ClientFingerprint,
+				Certificate:       v.option.Certificate,
+				PrivateKey:        v.option.PrivateKey,
 				ECH:               v.echConfig,
 				Reality:           v.realityConfig,
 				NextProtos:        v.option.ALPN,
@@ -211,7 +216,8 @@ func (v *Vmess) StreamConnContext(ctx context.Context, c net.Conn, metadata *C.M
 
 		c, err = h2.StreamConn(ctx, c, h2Opts)
 	case "grpc":
-		c, err = gun.StreamGunWithConn(c, v.gunTLSConfig, v.gunConfig, v.echConfig, v.realityConfig)
+		// ✨ 修复：gRPC 传入证书以支持 mTLS
+		c, err = gun.StreamGunWithConn(c, v.gunTLSConfig, v.gunConfig, v.option.Certificate, v.option.PrivateKey, v.echConfig, v.realityConfig)
 	default:
 		// handle TLS
 		if v.option.TLS {
@@ -531,7 +537,8 @@ func NewVmess(option VmessOption) (*Vmess, error) {
 		v.gunTLSConfig = tlsConfig
 		v.gunConfig = gunConfig
 
-		v.transport = gun.NewHTTP2Client(dialFn, tlsConfig, v.option.ClientFingerprint, v.echConfig, v.realityConfig)
+		// ✨ 修复：传递证书以支持 mTLS
+		v.transport = gun.NewHTTP2Client(dialFn, tlsConfig, v.option.ClientFingerprint, v.option.Certificate, v.option.PrivateKey, v.echConfig, v.realityConfig)
 	case "splithttp", "xhttp":
 		transport, err := NewSplitHTTPTransport(
 			v.option.SplitHTTPOpts, v.dialer, v.addr, option.TLS,

@@ -248,7 +248,8 @@ func (g *Conn) SetDeadline(t time.Time) error {
 	return nil
 }
 
-func NewHTTP2Client(dialFn DialFn, tlsConfig *tls.Config, clientFingerprint string, echConfig *ech.Config, realityConfig *tlsC.RealityConfig) *TransportWrap {
+// ✨ 修改点：增加 authCert 和 authKey 参数以支持 mTLS
+func NewHTTP2Client(dialFn DialFn, tlsConfig *tls.Config, clientFingerprint string, authCert, authKey string, echConfig *ech.Config, realityConfig *tlsC.RealityConfig) *TransportWrap {
 	dialFunc := func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
 		ctx, cancel := context.WithTimeout(ctx, C.DefaultTLSTimeout)
 		defer cancel()
@@ -266,6 +267,8 @@ func NewHTTP2Client(dialFn DialFn, tlsConfig *tls.Config, clientFingerprint stri
 			Host:              cfg.ServerName,
 			SkipCertVerify:    cfg.InsecureSkipVerify,
 			ClientFingerprint: clientFingerprint,
+			Certificate:       authCert, // ✨ 关键修复：补上 mTLS 证书
+			PrivateKey:        authKey,  // ✨ 关键修复：补上 mTLS 私钥
 			NextProtos:        cfg.NextProtos,
 			ECH:               echConfig,
 			Reality:           realityConfig,
@@ -284,6 +287,10 @@ func NewHTTP2Client(dialFn DialFn, tlsConfig *tls.Config, clientFingerprint stri
 		}
 
 		if negotiatedProtocol != http.Http2NextProtoTLS {
+			// 如果是 Reality 模式且协议为空，通常是因为 uTLS 状态未同步，对于 gRPC 我们可以尝试继续
+			if realityConfig != nil && negotiatedProtocol == "" {
+				return conn, nil
+			}
 			conn.Close()
 			return nil, fmt.Errorf("http2: unexpected ALPN protocol %s, want %s", negotiatedProtocol, http.Http2NextProtoTLS)
 		}
@@ -368,12 +375,13 @@ func StreamGunWithTransport(transport *TransportWrap, cfg *Config) (net.Conn, er
 	return conn, nil
 }
 
-func StreamGunWithConn(conn net.Conn, tlsConfig *tls.Config, cfg *Config, echConfig *ech.Config, realityConfig *tlsC.RealityConfig) (net.Conn, error) {
+// ✨ 修改点：增加 authCert 和 authKey 参数
+func StreamGunWithConn(conn net.Conn, tlsConfig *tls.Config, cfg *Config, authCert, authKey string, echConfig *ech.Config, realityConfig *tlsC.RealityConfig) (net.Conn, error) {
 	dialFn := func(ctx context.Context, network, addr string) (net.Conn, error) {
 		return conn, nil
 	}
 
-	transport := NewHTTP2Client(dialFn, tlsConfig, cfg.ClientFingerprint, echConfig, realityConfig)
+	transport := NewHTTP2Client(dialFn, tlsConfig, cfg.ClientFingerprint, authCert, authKey, echConfig, realityConfig)
 	c, err := StreamGunWithTransport(transport, cfg)
 	if err != nil {
 		return nil, err

@@ -93,6 +93,9 @@ func (v *Vless) StreamConnContext(ctx context.Context, c net.Conn, metadata *C.M
 			ClientFingerprint:        v.option.ClientFingerprint,
 			ECHConfig:                v.echConfig,
 			Headers:                  http.Header{},
+			// ✨ 修复：WebSocket 传入证书以支持 mTLS
+			Certificate: v.option.Certificate,
+			PrivateKey:  v.option.PrivateKey,
 		}
 
 		if len(v.option.WSOpts.Headers) != 0 {
@@ -157,7 +160,8 @@ func (v *Vless) StreamConnContext(ctx context.Context, c net.Conn, metadata *C.M
 
 		c, err = h2.StreamConn(ctx, c, h2Opts)
 	case "grpc":
-		c, err = gun.StreamGunWithConn(c, v.gunTLSConfig, v.gunConfig, v.echConfig, v.realityConfig)
+		// ✨ 修复：gRPC 传入证书以支持 mTLS
+		c, err = gun.StreamGunWithConn(c, v.gunTLSConfig, v.gunConfig, v.option.Certificate, v.option.PrivateKey, v.echConfig, v.realityConfig)
 	default:
 		c, err = v.streamTLSConn(ctx, c, false)
 	}
@@ -305,7 +309,7 @@ func (v *Vless) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (
 	if v.transport != nil {
 		c, err = gun.StreamGunWithTransport(v.transport, v.gunConfig)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("%s connect error: %w", v.addr, err)
 		}
 		defer func(c net.Conn) {
 			safeConnClose(c, err)
@@ -529,7 +533,8 @@ func NewVless(option VlessOption) (*Vless, error) {
 		v.gunTLSConfig = tlsConfig
 		v.gunConfig = gunConfig
 
-		v.transport = gun.NewHTTP2Client(dialFn, tlsConfig, v.option.ClientFingerprint, v.echConfig, v.realityConfig)
+		// ✨ 修复：gRPC 传入证书以支持 mTLS
+		v.transport = gun.NewHTTP2Client(dialFn, tlsConfig, v.option.ClientFingerprint, v.option.Certificate, v.option.PrivateKey, v.echConfig, v.realityConfig)
 	case "splithttp", "xhttp":
 		transport, err := NewSplitHTTPTransport(
 			v.option.SplitHTTPOpts, v.dialer, v.addr, option.TLS,

@@ -85,8 +85,11 @@ func (t *Trojan) StreamConnContext(ctx context.Context, c net.Conn, metadata *C.
 			V2rayHttpUpgrade:         t.option.WSOpts.V2rayHttpUpgrade,
 			V2rayHttpUpgradeFastOpen: t.option.WSOpts.V2rayHttpUpgradeFastOpen,
 			ClientFingerprint:        t.option.ClientFingerprint,
-			ECHConfig:                t.echConfig,
-			Headers:                  http.Header{},
+			// ✨ 修复：为 WebSocket 配置传入证书信息
+			Certificate: t.option.Certificate,
+			PrivateKey:  t.option.PrivateKey,
+			ECHConfig:   t.echConfig,
+			Headers:     http.Header{},
 		}
 
 		if t.option.SNI != "" {
@@ -124,7 +127,8 @@ func (t *Trojan) StreamConnContext(ctx context.Context, c net.Conn, metadata *C.
 
 		c, err = ws.StreamConn(ctx, c, wsOpts)
 	case "grpc":
-		c, err = gun.StreamGunWithConn(c, t.gunTLSConfig, t.gunConfig, t.echConfig, t.realityConfig)
+		// ✨ 修复：为 gRPC 配置传入证书信息
+		c, err = gun.StreamGunWithConn(c, t.gunTLSConfig, t.gunConfig, t.option.Certificate, t.option.PrivateKey, t.echConfig, t.realityConfig)
 	default:
 		if t.option.TLS {
 			alpn := trojan.DefaultALPN
@@ -382,7 +386,8 @@ func NewTrojan(option TrojanOption) (*Trojan, error) {
 			return nil, err
 		}
 
-		t.transport = gun.NewHTTP2Client(dialFn, tlsConfig, option.ClientFingerprint, t.echConfig, t.realityConfig)
+		// ✨ 修复：增加证书参数传递
+		t.transport = gun.NewHTTP2Client(dialFn, tlsConfig, option.ClientFingerprint, option.Certificate, option.PrivateKey, t.echConfig, t.realityConfig)
 
 		t.gunTLSConfig = tlsConfig
 		t.gunConfig = &gun.Config{

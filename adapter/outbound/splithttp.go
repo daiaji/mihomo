@@ -133,5 +133,6 @@ func NewSplitHTTPTransport(
 
 	conf := ParseSplitHTTPConfig(opts, defaultHost)
 
-	return splithttp.NewTransport(dialFn, listenPacketFn, tlsConfig, conf, clientFingerprint, echConfig, realityConfig), nil
+	// ✨ 修复：传入 certificate 和 privateKey 给传输层，支持 mTLS
+	return splithttp.NewTransport(dialFn, listenPacketFn, tlsConfig, conf, clientFingerprint, certificate, privateKey, echConfig, realityConfig), nil
 }
