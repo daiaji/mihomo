@@ -9,14 +9,15 @@ import (
 	"github.com/metacubex/mihomo/adapter/inbound"
 	"github.com/metacubex/mihomo/component/ca"
 	"github.com/metacubex/mihomo/component/ech"
+	ws "github.com/metacubex/mihomo/component/transport/websocket"
 	C "github.com/metacubex/mihomo/constant"
 	LC "github.com/metacubex/mihomo/listener/config"
 	"github.com/metacubex/mihomo/listener/reality"
 	"github.com/metacubex/mihomo/listener/sing"
 	"github.com/metacubex/mihomo/ntp"
 	"github.com/metacubex/mihomo/transport/gun"
+	"github.com/metacubex/mihomo/transport/splithttp"
 	"github.com/metacubex/mihomo/transport/vless/encryption"
-	mihomoVMess "github.com/metacubex/mihomo/transport/vmess"
 
 	"github.com/metacubex/http"
 	"github.com/metacubex/sing/common"
@@ -78,7 +79,6 @@ func New(config LC.VlessServer, tunnel C.Tunnel, additions ...inbound.Addition) 
 
 	tlsConfig := &tls.Config{Time: ntp.Now}
 	var realityBuilder *reality.Builder
-	var httpServer http.Server
 
 	if config.Certificate != "" && config.PrivateKey != "" {
 		certLoader, err := ca.NewTLSKeyPairLoader(config.Certificate, config.PrivateKey)
@@ -121,29 +121,67 @@ func New(config LC.VlessServer, tunnel C.Tunnel, additions ...inbound.Addition) 
 			return nil, err
 		}
 	}
+
+	// 初始化多路复用 HTTP Mux
+	var sharedHttpMux *http.ServeMux
+	if config.WsPath != "" || config.SplitHTTP.Path != "" {
+		sharedHttpMux = http.NewServeMux()
+		tlsConfig.NextProtos = append(tlsConfig.NextProtos, "h2")
+		// ✨ 修正：仅当且仅当配置了 WebSocket 时，才附加 http/1.1 支持
+		if config.WsPath != "" {
+			tlsConfig.NextProtos = append(tlsConfig.NextProtos, "http/1.1")
+		}
+	}
+
 	if config.WsPath != "" {
-		httpMux := http.NewServeMux()
-		httpMux.HandleFunc(config.WsPath, func(w http.ResponseWriter, r *http.Request) {
-			conn, err := mihomoVMess.StreamUpgradedWebsocketConn(w, r)
+		sharedHttpMux.HandleFunc(config.WsPath, func(w http.ResponseWriter, r *http.Request) {
+			conn, err := ws.StreamUpgradedWebsocketConn(w, r)
 			if err != nil {
 				http.Error(w, err.Error(), 500)
 				return
 			}
 			sl.HandleConn(conn, tunnel, additions...)
 		})
-		httpServer.Handler = httpMux
-		tlsConfig.NextProtos = append(tlsConfig.NextProtos, "http/1.1")
 	}
-	if config.GrpcServiceName != "" {
-		httpServer.Handler = gun.NewServerHandler(gun.ServerOption{
-			ServiceName: config.GrpcServiceName,
-			ConnHandler: func(conn net.Conn) {
-				sl.HandleConn(conn, tunnel, additions...)
-			},
-			HttpHandler: httpServer.Handler,
+
+	if config.SplitHTTP.Path != "" {
+		shConfig := &splithttp.Config{
+			Path:                 config.SplitHTTP.Path,
+			Mode:                 config.SplitHTTP.Mode,
+			Headers:              config.SplitHTTP.Headers,
+			XPaddingBytes:        config.SplitHTTP.XPaddingBytes,
+			XPaddingObfsMode:     config.SplitHTTP.XPaddingObfsMode,
+			XPaddingKey:          config.SplitHTTP.XPaddingKey,
+			XPaddingHeader:       config.SplitHTTP.XPaddingHeader,
+			XPaddingPlacement:    config.SplitHTTP.XPaddingPlacement,
+			XPaddingMethod:       config.SplitHTTP.XPaddingMethod,
+			UplinkHTTPMethod:     config.SplitHTTP.UplinkHTTPMethod,
+			NoGRPCHeader:         config.SplitHTTP.NoGRPCHeader,
+			NoSSEHeader:          config.SplitHTTP.NoSSEHeader,
+			SessionPlacement:     config.SplitHTTP.SessionPlacement,
+			SessionKey:           config.SplitHTTP.SessionKey,
+			SeqPlacement:         config.SplitHTTP.SeqPlacement,
+			SeqKey:               config.SplitHTTP.SeqKey,
+			UplinkDataPlacement:  config.SplitHTTP.UplinkDataPlacement,
+			UplinkDataKey:        config.SplitHTTP.UplinkDataKey,
+			UplinkChunkSize:      config.SplitHTTP.UplinkChunkSize,
+			ScMaxEachPostBytes:   config.SplitHTTP.ScMaxEachPostBytes,
+			ScMinPostsIntervalMs: config.SplitHTTP.ScMinPostsIntervalMs,
+			ScMaxBufferedPosts:   int32(config.SplitHTTP.ScMaxBufferedPosts),
+			ScStreamUpServerSecs: config.SplitHTTP.ScStreamUpServerSecs,
+		}
+
+		shHandler := splithttp.NewServerHandler(shConfig, func(conn net.Conn) {
+			sl.HandleConn(conn, tunnel, additions...)
 		})
-		tlsConfig.NextProtos = append([]string{"h2"}, tlsConfig.NextProtos...) // h2 must before http/1.1
+
+		sharedHttpMux.Handle(shConfig.GetNormalizedPath(), shHandler)
 	}
+
+	protocols := new(http.Protocols)
+	protocols.SetHTTP1(true)
+	protocols.SetUnencryptedHTTP2(true) // ✨ 开启 H2C 支持
+	protocols.SetHTTP2(true)
 
 	for _, addr := range strings.Split(config.Listen, ",") {
 		addr := addr
@@ -157,28 +195,48 @@ func New(config LC.VlessServer, tunnel C.Tunnel, additions ...inbound.Addition) 
 			l = realityBuilder.NewListener(l)
 		} else if tlsConfig.GetCertificate != nil {
 			l = tls.NewListener(l, tlsConfig)
-		} else if sl.decryption == nil {
-			return nil, errors.New("disallow using Vless without any certificates/reality/decryption config")
+		} else if sl.decryption == nil && config.WsPath == "" && config.SplitHTTP.Path == "" && config.GrpcServiceName == "" {
+			return nil, errors.New("disallow using Vless without any certificates/reality/decryption/transport config")
 		}
 		sl.listeners = append(sl.listeners, l)
 
-		go func() {
-			if httpServer.Handler != nil {
-				_ = httpServer.Serve(l)
-				return
-			}
-			for {
-				c, err := l.Accept()
-				if err != nil {
-					if sl.closed {
-						break
-					}
-					continue
-				}
+		srv := &http.Server{
+			TLSConfig: tlsConfig,
+			Protocols: protocols,
+		}
+		if sharedHttpMux != nil {
+			srv.Handler = sharedHttpMux
+		}
 
-				go sl.HandleConn(c, tunnel)
-			}
-		}()
+		if config.GrpcServiceName != "" {
+			srv.Handler = gun.NewServerHandler(gun.ServerOption{
+				ServiceName: config.GrpcServiceName,
+				ConnHandler: func(conn net.Conn) {
+					sl.HandleConn(conn, tunnel, additions...)
+				},
+				HttpHandler: srv.Handler, // 嵌套原有的 Mux
+			})
+		}
+
+        go func() {
+            // 只有显式开启了传输层（WS/SplitHTTP/gRPC）才允许 HTTP 栈介入
+            if srv.Handler != nil {
+                _ = srv.Serve(l)
+                return
+            }
+
+            // 原始 TCP 路径：严禁 HTTP 栈读取任何字节
+            for {
+                c, err := l.Accept()
+                if err != nil {
+                    if sl.closed { break }
+                    continue
+                }
+
+                // ⚠️ 必须回传 additions，这是测试通过的基石
+                go sl.HandleConn(c, tunnel, additions...) 
+            }
+        }()
 	}
 
 	return sl, nil

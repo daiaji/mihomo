@@ -20,6 +20,7 @@ import (
 	"github.com/metacubex/mihomo/common/pool"
 	"github.com/metacubex/mihomo/component/ech"
 	tlsC "github.com/metacubex/mihomo/component/tls"
+	shareTLS "github.com/metacubex/mihomo/component/transport/tls"
 	C "github.com/metacubex/mihomo/constant"
 
 	"github.com/metacubex/http"
@@ -260,58 +261,31 @@ func NewHTTP2Client(dialFn DialFn, tlsConfig *tls.Config, clientFingerprint stri
 			return pconn, nil
 		}
 
-		if clientFingerprint, ok := tlsC.GetFingerprint(clientFingerprint); ok {
-			if realityConfig == nil {
-				tlsConfig := tlsC.UConfig(cfg)
-				err := echConfig.ClientHandleUTLS(ctx, tlsConfig)
-				if err != nil {
-					pconn.Close()
-					return nil, err
-				}
-				tlsConn := tlsC.UClient(pconn, tlsConfig, clientFingerprint)
-				if err := tlsConn.HandshakeContext(ctx); err != nil {
-					pconn.Close()
-					return nil, err
-				}
-				state := tlsConn.ConnectionState()
-				if p := state.NegotiatedProtocol; p != http.Http2NextProtoTLS {
-					tlsConn.Close()
-					return nil, fmt.Errorf("http2: unexpected ALPN protocol %s, want %s", p, http.Http2NextProtoTLS)
-				}
-				return tlsConn, nil
-			} else {
-				realityConn, err := tlsC.GetRealityConn(ctx, pconn, clientFingerprint, cfg.ServerName, realityConfig)
-				if err != nil {
-					pconn.Close()
-					return nil, err
-				}
-				//state := realityConn.(*utls.UConn).ConnectionState()
-				//if p := state.NegotiatedProtocol; p != http.Http2NextProtoTLS {
-				//	realityConn.Close()
-				//	return nil, fmt.Errorf("http2: unexpected ALPN protocol %s, want %s", p, http.Http2NextProtoTLS)
-				//}
-				return realityConn, nil
-			}
-		}
-		if realityConfig != nil {
-			return nil, errors.New("REALITY is based on uTLS, please set a client-fingerprint")
-		}
-
-		err = echConfig.ClientHandle(ctx, cfg)
+		// ✨ 魔法发生在这里：用一行代码替换掉原本 40 行的 TLS 判断逻辑
+		conn, err := shareTLS.StreamTLSConn(ctx, pconn, &shareTLS.Config{
+			Host:              cfg.ServerName,
+			SkipCertVerify:    cfg.InsecureSkipVerify,
+			ClientFingerprint: clientFingerprint,
+			NextProtos:        cfg.NextProtos,
+			ECH:               echConfig,
+			Reality:           realityConfig,
+		})
 		if err != nil {
 			pconn.Close()
 			return nil, err
 		}
 
-		conn := tls.Client(pconn, cfg)
-		if err := conn.HandshakeContext(ctx); err != nil {
-			pconn.Close()
-			return nil, err
+		// 验证 ALPN
+		var negotiatedProtocol string
+		if uconn, ok := conn.(*tlsC.UConn); ok {
+			negotiatedProtocol = uconn.ConnectionState().NegotiatedProtocol
+		} else if tconn, ok := conn.(*tls.Conn); ok {
+			negotiatedProtocol = tconn.ConnectionState().NegotiatedProtocol
 		}
-		state := conn.ConnectionState()
-		if p := state.NegotiatedProtocol; p != http.Http2NextProtoTLS {
+
+		if negotiatedProtocol != http.Http2NextProtoTLS {
 			conn.Close()
-			return nil, fmt.Errorf("http2: unexpected ALPN protocol %s, want %s", p, http.Http2NextProtoTLS)
+			return nil, fmt.Errorf("http2: unexpected ALPN protocol %s, want %s", negotiatedProtocol, http.Http2NextProtoTLS)
 		}
 		return conn, nil
 	}

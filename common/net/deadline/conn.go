@@ -7,6 +7,7 @@ import (
 
 	"github.com/metacubex/mihomo/common/atomic"
 
+	"github.com/metacubex/sing/common" // Import sing common
 	"github.com/metacubex/sing/common/buf"
 	"github.com/metacubex/sing/common/bufio"
 	"github.com/metacubex/sing/common/network"
@@ -154,5 +155,8 @@ func (c *Conn) WriterReplaceable() bool {
 }
 
 func (c *Conn) Upstream() any {
+	if upstream, ok := c.ExtendedConn.(common.WithUpstream); ok {
+		return upstream.Upstream()
+	}
 	return c.ExtendedConn
 }

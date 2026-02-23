@@ -14,10 +14,14 @@ import (
 	"github.com/metacubex/mihomo/component/ca"
 	"github.com/metacubex/mihomo/component/ech"
 	tlsC "github.com/metacubex/mihomo/component/tls"
+	"github.com/metacubex/mihomo/component/transport/h2"
+	"github.com/metacubex/mihomo/component/transport/httpobfs"
+	shareTLS "github.com/metacubex/mihomo/component/transport/tls"
+	ws "github.com/metacubex/mihomo/component/transport/websocket"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/ntp"
 	"github.com/metacubex/mihomo/transport/gun"
-	mihomoVMess "github.com/metacubex/mihomo/transport/vmess"
+	"github.com/metacubex/mihomo/transport/splithttp"
 
 	"github.com/metacubex/http"
 	vmess "github.com/metacubex/sing-vmess"
@@ -33,10 +37,11 @@ type Vmess struct {
 	client *vmess.Client
 	option *VmessOption
 
-	// for gun mux
 	gunTLSConfig *tls.Config
 	gunConfig    *gun.Config
 	transport    *gun.TransportWrap
+
+	splitHTTPTransport *splithttp.TransportWrap
 
 	realityConfig *tlsC.RealityConfig
 	echConfig     *ech.Config
@@ -44,33 +49,34 @@ type Vmess struct {
 
 type VmessOption struct {
 	BasicOption
-	Name                string         `proxy:"name"`
-	Server              string         `proxy:"server"`
-	Port                int            `proxy:"port"`
-	UUID                string         `proxy:"uuid"`
-	AlterID             int            `proxy:"alterId"`
-	Cipher              string         `proxy:"cipher"`
-	UDP                 bool           `proxy:"udp,omitempty"`
-	Network             string         `proxy:"network,omitempty"`
-	TLS                 bool           `proxy:"tls,omitempty"`
-	ALPN                []string       `proxy:"alpn,omitempty"`
-	SkipCertVerify      bool           `proxy:"skip-cert-verify,omitempty"`
-	Fingerprint         string         `proxy:"fingerprint,omitempty"`
-	Certificate         string         `proxy:"certificate,omitempty"`
-	PrivateKey          string         `proxy:"private-key,omitempty"`
-	ServerName          string         `proxy:"servername,omitempty"`
-	ECHOpts             ECHOptions     `proxy:"ech-opts,omitempty"`
-	RealityOpts         RealityOptions `proxy:"reality-opts,omitempty"`
-	HTTPOpts            HTTPOptions    `proxy:"http-opts,omitempty"`
-	HTTP2Opts           HTTP2Options   `proxy:"h2-opts,omitempty"`
-	GrpcOpts            GrpcOptions    `proxy:"grpc-opts,omitempty"`
-	WSOpts              WSOptions      `proxy:"ws-opts,omitempty"`
-	PacketAddr          bool           `proxy:"packet-addr,omitempty"`
-	XUDP                bool           `proxy:"xudp,omitempty"`
-	PacketEncoding      string         `proxy:"packet-encoding,omitempty"`
-	GlobalPadding       bool           `proxy:"global-padding,omitempty"`
-	AuthenticatedLength bool           `proxy:"authenticated-length,omitempty"`
-	ClientFingerprint   string         `proxy:"client-fingerprint,omitempty"`
+	Name                string           `proxy:"name"`
+	Server              string           `proxy:"server"`
+	Port                int              `proxy:"port"`
+	UUID                string           `proxy:"uuid"`
+	AlterID             int              `proxy:"alterId"`
+	Cipher              string           `proxy:"cipher"`
+	UDP                 bool             `proxy:"udp,omitempty"`
+	Network             string           `proxy:"network,omitempty"`
+	TLS                 bool             `proxy:"tls,omitempty"`
+	ALPN                []string         `proxy:"alpn,omitempty"`
+	SkipCertVerify      bool             `proxy:"skip-cert-verify,omitempty"`
+	Fingerprint         string           `proxy:"fingerprint,omitempty"`
+	Certificate         string           `proxy:"certificate,omitempty"`
+	PrivateKey          string           `proxy:"private-key,omitempty"`
+	ServerName          string           `proxy:"servername,omitempty"`
+	ECHOpts             ECHOptions       `proxy:"ech-opts,omitempty"`
+	RealityOpts         RealityOptions   `proxy:"reality-opts,omitempty"`
+	HTTPOpts            HTTPOptions      `proxy:"http-opts,omitempty"`
+	HTTP2Opts           HTTP2Options     `proxy:"h2-opts,omitempty"`
+	GrpcOpts            GrpcOptions      `proxy:"grpc-opts,omitempty"`
+	WSOpts              WSOptions        `proxy:"ws-opts,omitempty"`
+	SplitHTTPOpts       SplitHTTPOptions `proxy:"splithttp-opts,omitempty"`
+	PacketAddr          bool             `proxy:"packet-addr,omitempty"`
+	XUDP                bool             `proxy:"xudp,omitempty"`
+	PacketEncoding      string           `proxy:"packet-encoding,omitempty"`
+	GlobalPadding       bool             `proxy:"global-padding,omitempty"`
+	AuthenticatedLength bool             `proxy:"authenticated-length,omitempty"`
+	ClientFingerprint   string           `proxy:"client-fingerprint,omitempty"`
 }
 
 type HTTPOptions struct {
@@ -103,7 +109,7 @@ func (v *Vmess) StreamConnContext(ctx context.Context, c net.Conn, metadata *C.M
 	switch v.option.Network {
 	case "ws":
 		host, port, _ := net.SplitHostPort(v.addr)
-		wsOpts := &mihomoVMess.WebsocketConfig{
+		wsOpts := &ws.Config{
 			Host:                     host,
 			Port:                     port,
 			Path:                     v.option.WSOpts.Path,
@@ -144,12 +150,12 @@ func (v *Vmess) StreamConnContext(ctx context.Context, c net.Conn, metadata *C.M
 				wsOpts.TLSConfig.ServerName = host
 			}
 		}
-		c, err = mihomoVMess.StreamWebsocketConn(ctx, c, wsOpts)
+		c, err = ws.StreamConn(ctx, c, wsOpts)
 	case "http":
 		// readability first, so just copy default TLS logic
 		if v.option.TLS {
 			host, _, _ := net.SplitHostPort(v.addr)
-			tlsOpts := &mihomoVMess.TLSConfig{
+			tlsOpts := &shareTLS.Config{
 				Host:              host,
 				SkipCertVerify:    v.option.SkipCertVerify,
 				ClientFingerprint: v.option.ClientFingerprint,
@@ -161,24 +167,24 @@ func (v *Vmess) StreamConnContext(ctx context.Context, c net.Conn, metadata *C.M
 			if v.option.ServerName != "" {
 				tlsOpts.Host = v.option.ServerName
 			}
-			c, err = mihomoVMess.StreamTLSConn(ctx, c, tlsOpts)
+			c, err = shareTLS.StreamTLSConn(ctx, c, tlsOpts)
 			if err != nil {
 				return nil, err
 			}
 		}
 
 		host, _, _ := net.SplitHostPort(v.addr)
-		httpOpts := &mihomoVMess.HTTPConfig{
+		httpOpts := &httpobfs.Config{
 			Host:    host,
 			Method:  v.option.HTTPOpts.Method,
 			Path:    v.option.HTTPOpts.Path,
 			Headers: v.option.HTTPOpts.Headers,
 		}
 
-		c = mihomoVMess.StreamHTTPConn(c, httpOpts)
+		c = httpobfs.StreamConn(c, httpOpts)
 	case "h2":
 		host, _, _ := net.SplitHostPort(v.addr)
-		tlsOpts := mihomoVMess.TLSConfig{
+		tlsOpts := shareTLS.Config{
 			Host:              host,
 			SkipCertVerify:    v.option.SkipCertVerify,
 			FingerPrint:       v.option.Fingerprint,
@@ -193,24 +199,24 @@ func (v *Vmess) StreamConnContext(ctx context.Context, c net.Conn, metadata *C.M
 			tlsOpts.Host = v.option.ServerName
 		}
 
-		c, err = mihomoVMess.StreamTLSConn(ctx, c, &tlsOpts)
+		c, err = shareTLS.StreamTLSConn(ctx, c, &tlsOpts)
 		if err != nil {
 			return nil, err
 		}
 
-		h2Opts := &mihomoVMess.H2Config{
+		h2Opts := &h2.Config{
 			Hosts: v.option.HTTP2Opts.Host,
 			Path:  v.option.HTTP2Opts.Path,
 		}
 
-		c, err = mihomoVMess.StreamH2Conn(ctx, c, h2Opts)
+		c, err = h2.StreamConn(ctx, c, h2Opts)
 	case "grpc":
 		c, err = gun.StreamGunWithConn(c, v.gunTLSConfig, v.gunConfig, v.echConfig, v.realityConfig)
 	default:
 		// handle TLS
 		if v.option.TLS {
 			host, _, _ := net.SplitHostPort(v.addr)
-			tlsOpts := &mihomoVMess.TLSConfig{
+			tlsOpts := &shareTLS.Config{
 				Host:              host,
 				SkipCertVerify:    v.option.SkipCertVerify,
 				FingerPrint:       v.option.Fingerprint,
@@ -226,7 +232,7 @@ func (v *Vmess) StreamConnContext(ctx context.Context, c net.Conn, metadata *C.M
 				tlsOpts.Host = v.option.ServerName
 			}
 
-			c, err = mihomoVMess.StreamTLSConn(ctx, c, tlsOpts)
+			c, err = shareTLS.StreamTLSConn(ctx, c, tlsOpts)
 		}
 	}
 
@@ -292,8 +298,20 @@ func (v *Vmess) streamConnContext(ctx context.Context, c net.Conn, metadata *C.M
 	return
 }
 
-// DialContext implements C.ProxyAdapter
 func (v *Vmess) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Conn, err error) {
+	if v.splitHTTPTransport != nil {
+		c, err := v.splitHTTPTransport.DialContext(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("%s connect error: %s", v.addr, err.Error())
+		}
+		defer func(c net.Conn) { safeConnClose(c, err) }(c)
+
+		c, err = v.streamConnContext(ctx, c, metadata)
+		if err != nil {
+			return nil, err
+		}
+		return NewConn(c, v), nil
+	}
 	var c net.Conn
 	// gun transport
 	if v.transport != nil {
@@ -324,10 +342,22 @@ func (v *Vmess) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Conn
 	return NewConn(c, v), err
 }
 
-// ListenPacketContext implements C.ProxyAdapter
 func (v *Vmess) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (_ C.PacketConn, err error) {
 	if err = v.ResolveUDP(ctx, metadata); err != nil {
 		return nil, err
+	}
+	if v.splitHTTPTransport != nil {
+		c, err := v.splitHTTPTransport.DialContext(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("splithttp connect error: %v", err)
+		}
+		defer func(c net.Conn) { safeConnClose(c, err) }(c)
+
+		c, err = v.streamConnContext(ctx, c, metadata)
+		if err != nil {
+			return nil, fmt.Errorf("new vmess client error: %v", err)
+		}
+		return v.ListenPacketOnStreamConn(ctx, c, metadata)
 	}
 	var c net.Conn
 	// gun transport
@@ -377,6 +407,9 @@ func (v *Vmess) ProxyInfo() C.ProxyInfo {
 func (v *Vmess) Close() error {
 	if v.transport != nil {
 		return v.transport.Close()
+	}
+	if v.splitHTTPTransport != nil {
+		return v.splitHTTPTransport.Close()
 	}
 	return nil
 }
@@ -499,6 +532,17 @@ func NewVmess(option VmessOption) (*Vmess, error) {
 		v.gunConfig = gunConfig
 
 		v.transport = gun.NewHTTP2Client(dialFn, tlsConfig, v.option.ClientFingerprint, v.echConfig, v.realityConfig)
+	case "splithttp", "xhttp":
+		transport, err := NewSplitHTTPTransport(
+			v.option.SplitHTTPOpts, v.dialer, v.addr, option.TLS,
+			option.ServerName, option.SkipCertVerify, option.Fingerprint,
+			option.Certificate, option.PrivateKey, option.ClientFingerprint,
+			option.ALPN, v.echConfig, v.realityConfig,
+		)
+		if err != nil {
+			return nil, err
+		}
+		v.splitHTTPTransport = transport
 	}
 
 	return v, nil

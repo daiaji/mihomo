@@ -11,11 +11,13 @@ import (
 	"github.com/metacubex/mihomo/component/ca"
 	"github.com/metacubex/mihomo/component/ech"
 	tlsC "github.com/metacubex/mihomo/component/tls"
+	shareTLS "github.com/metacubex/mihomo/component/transport/tls"
+	ws "github.com/metacubex/mihomo/component/transport/websocket"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/transport/gun"
 	"github.com/metacubex/mihomo/transport/shadowsocks/core"
+	"github.com/metacubex/mihomo/transport/splithttp"
 	"github.com/metacubex/mihomo/transport/trojan"
-	"github.com/metacubex/mihomo/transport/vmess"
 
 	"github.com/metacubex/http"
 	"github.com/metacubex/tls"
@@ -31,6 +33,8 @@ type Trojan struct {
 	gunConfig    *gun.Config
 	transport    *gun.TransportWrap
 
+	splitHTTPTransport *splithttp.TransportWrap
+
 	realityConfig *tlsC.RealityConfig
 	echConfig     *ech.Config
 
@@ -39,40 +43,40 @@ type Trojan struct {
 
 type TrojanOption struct {
 	BasicOption
-	Name              string         `proxy:"name"`
-	Server            string         `proxy:"server"`
-	Port              int            `proxy:"port"`
-	Password          string         `proxy:"password"`
-	ALPN              []string       `proxy:"alpn,omitempty"`
-	SNI               string         `proxy:"sni,omitempty"`
-	SkipCertVerify    bool           `proxy:"skip-cert-verify,omitempty"`
-	Fingerprint       string         `proxy:"fingerprint,omitempty"`
-	Certificate       string         `proxy:"certificate,omitempty"`
-	PrivateKey        string         `proxy:"private-key,omitempty"`
-	UDP               bool           `proxy:"udp,omitempty"`
-	Network           string         `proxy:"network,omitempty"`
-	ECHOpts           ECHOptions     `proxy:"ech-opts,omitempty"`
-	RealityOpts       RealityOptions `proxy:"reality-opts,omitempty"`
-	GrpcOpts          GrpcOptions    `proxy:"grpc-opts,omitempty"`
-	WSOpts            WSOptions      `proxy:"ws-opts,omitempty"`
-	SSOpts            TrojanSSOption `proxy:"ss-opts,omitempty"`
-	ClientFingerprint string         `proxy:"client-fingerprint,omitempty"`
+	Name              string           `proxy:"name"`
+	Server            string           `proxy:"server"`
+	Port              int              `proxy:"port"`
+	Password          string           `proxy:"password"`
+	TLS               bool             `proxy:"tls,omitempty"`
+	ALPN              []string         `proxy:"alpn,omitempty"`
+	SNI               string           `proxy:"sni,omitempty"`
+	SkipCertVerify    bool             `proxy:"skip-cert-verify,omitempty"`
+	Fingerprint       string           `proxy:"fingerprint,omitempty"`
+	Certificate       string           `proxy:"certificate,omitempty"`
+	PrivateKey        string           `proxy:"private-key,omitempty"`
+	UDP               bool             `proxy:"udp,omitempty"`
+	Network           string           `proxy:"network,omitempty"`
+	ECHOpts           ECHOptions       `proxy:"ech-opts,omitempty"`
+	RealityOpts       RealityOptions   `proxy:"reality-opts,omitempty"`
+	GrpcOpts          GrpcOptions      `proxy:"grpc-opts,omitempty"`
+	WSOpts            WSOptions        `proxy:"ws-opts,omitempty"`
+	SplitHTTPOpts     SplitHTTPOptions `proxy:"splithttp-opts,omitempty"`
+	SSOpts            TrojanSSOption   `proxy:"ss-opts,omitempty"`
+	ClientFingerprint string           `proxy:"client-fingerprint,omitempty"`
 }
 
-// TrojanSSOption from https://github.com/p4gefau1t/trojan-go/blob/v0.10.6/tunnel/shadowsocks/config.go#L5
 type TrojanSSOption struct {
 	Enabled  bool   `proxy:"enabled,omitempty"`
 	Method   string `proxy:"method,omitempty"`
 	Password string `proxy:"password,omitempty"`
 }
 
-// StreamConnContext implements C.ProxyAdapter
 func (t *Trojan) StreamConnContext(ctx context.Context, c net.Conn, metadata *C.Metadata) (_ net.Conn, err error) {
 	switch t.option.Network {
 	case "ws":
 		host, port, _ := net.SplitHostPort(t.addr)
 
-		wsOpts := &vmess.WebsocketConfig{
+		wsOpts := &ws.Config{
 			Host:                     host,
 			Port:                     port,
 			Path:                     t.option.WSOpts.Path,
@@ -100,43 +104,45 @@ func (t *Trojan) StreamConnContext(ctx context.Context, c net.Conn, metadata *C.
 			alpn = t.option.ALPN
 		}
 
-		wsOpts.TLS = true
-		wsOpts.TLSConfig, err = ca.GetTLSConfig(ca.Option{
-			TLSConfig: &tls.Config{
-				NextProtos:         alpn,
-				MinVersion:         tls.VersionTLS12,
-				InsecureSkipVerify: t.option.SkipCertVerify,
-				ServerName:         t.option.SNI,
-			},
-			Fingerprint: t.option.Fingerprint,
-			Certificate: t.option.Certificate,
-			PrivateKey:  t.option.PrivateKey,
-		})
-		if err != nil {
-			return nil, err
+		if t.option.TLS {
+			wsOpts.TLS = true
+			wsOpts.TLSConfig, err = ca.GetTLSConfig(ca.Option{
+				TLSConfig: &tls.Config{
+					NextProtos:         alpn,
+					MinVersion:         tls.VersionTLS12,
+					InsecureSkipVerify: t.option.SkipCertVerify,
+					ServerName:         t.option.SNI,
+				},
+				Fingerprint: t.option.Fingerprint,
+				Certificate: t.option.Certificate,
+				PrivateKey:  t.option.PrivateKey,
+			})
+			if err != nil {
+				return nil, err
+			}
 		}
 
-		c, err = vmess.StreamWebsocketConn(ctx, c, wsOpts)
+		c, err = ws.StreamConn(ctx, c, wsOpts)
 	case "grpc":
 		c, err = gun.StreamGunWithConn(c, t.gunTLSConfig, t.gunConfig, t.echConfig, t.realityConfig)
 	default:
-		// default tcp network
-		// handle TLS
-		alpn := trojan.DefaultALPN
-		if t.option.ALPN != nil { // structure's Decode will ensure value not nil when input has value even it was set an empty array
-			alpn = t.option.ALPN
+		if t.option.TLS {
+			alpn := trojan.DefaultALPN
+			if t.option.ALPN != nil { // structure's Decode will ensure value not nil when input has value even it was set an empty array
+				alpn = t.option.ALPN
+			}
+			c, err = shareTLS.StreamTLSConn(ctx, c, &shareTLS.Config{
+				Host:              t.option.SNI,
+				SkipCertVerify:    t.option.SkipCertVerify,
+				FingerPrint:       t.option.Fingerprint,
+				Certificate:       t.option.Certificate,
+				PrivateKey:        t.option.PrivateKey,
+				ClientFingerprint: t.option.ClientFingerprint,
+				NextProtos:        alpn,
+				ECH:               t.echConfig,
+				Reality:           t.realityConfig,
+			})
 		}
-		c, err = vmess.StreamTLSConn(ctx, c, &vmess.TLSConfig{
-			Host:              t.option.SNI,
-			SkipCertVerify:    t.option.SkipCertVerify,
-			FingerPrint:       t.option.Fingerprint,
-			Certificate:       t.option.Certificate,
-			PrivateKey:        t.option.PrivateKey,
-			ClientFingerprint: t.option.ClientFingerprint,
-			NextProtos:        alpn,
-			ECH:               t.echConfig,
-			Reality:           t.realityConfig,
-		})
 	}
 	if err != nil {
 		return nil, fmt.Errorf("%s connect error: %w", t.addr, err)
@@ -175,10 +181,22 @@ func (t *Trojan) writeHeaderContext(ctx context.Context, c net.Conn, metadata *C
 	return err
 }
 
-// DialContext implements C.ProxyAdapter
 func (t *Trojan) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Conn, err error) {
+	if t.splitHTTPTransport != nil {
+		c, err := t.splitHTTPTransport.DialContext(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("%s connect error: %s", t.addr, err.Error())
+		}
+		defer func(c net.Conn) { safeConnClose(c, err) }(c)
+
+		c, err = t.streamConnContext(ctx, c, metadata)
+		if err != nil {
+			return nil, err
+		}
+		return NewConn(c, t), nil
+	}
+
 	var c net.Conn
-	// gun transport
 	if t.transport != nil {
 		c, err = gun.StreamGunWithTransport(t.transport, t.gunConfig)
 		if err != nil {
@@ -212,15 +230,27 @@ func (t *Trojan) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Con
 	return NewConn(c, t), err
 }
 
-// ListenPacketContext implements C.ProxyAdapter
 func (t *Trojan) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (_ C.PacketConn, err error) {
 	if err = t.ResolveUDP(ctx, metadata); err != nil {
 		return nil, err
 	}
 
-	var c net.Conn
+	if t.splitHTTPTransport != nil {
+		c, err := t.splitHTTPTransport.DialContext(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("splithttp connect error: %v", err)
+		}
+		defer func(c net.Conn) { safeConnClose(c, err) }(c)
 
-	// grpc transport
+		c, err = t.streamConnContext(ctx, c, metadata)
+		if err != nil {
+			return nil, fmt.Errorf("new trojan client error: %v", err)
+		}
+		pc := trojan.NewPacketConn(c)
+		return newPacketConn(pc, t), err
+	}
+
+	var c net.Conn
 	if t.transport != nil {
 		c, err = gun.StreamGunWithTransport(t.transport, t.gunConfig)
 		if err != nil {
@@ -238,9 +268,7 @@ func (t *Trojan) ListenPacketContext(ctx context.Context, metadata *C.Metadata) 
 		pc := trojan.NewPacketConn(c)
 		return newPacketConn(pc, t), err
 	}
-	if err = t.ResolveUDP(ctx, metadata); err != nil {
-		return nil, err
-	}
+
 	c, err = t.dialer.DialContext(ctx, "tcp", t.addr)
 	if err != nil {
 		return nil, fmt.Errorf("%s connect error: %w", t.addr, err)
@@ -273,6 +301,9 @@ func (t *Trojan) ProxyInfo() C.ProxyInfo {
 func (t *Trojan) Close() error {
 	if t.transport != nil {
 		return t.transport.Close()
+	}
+	if t.splitHTTPTransport != nil {
+		return t.splitHTTPTransport.Close()
 	}
 	return nil
 }
@@ -360,6 +391,17 @@ func NewTrojan(option TrojanOption) (*Trojan, error) {
 			Host:              option.SNI,
 			ClientFingerprint: option.ClientFingerprint,
 		}
+	} else if option.Network == "splithttp" || option.Network == "xhttp" {
+		transport, err := NewSplitHTTPTransport(
+			t.option.SplitHTTPOpts, t.dialer, t.addr, option.TLS,
+			option.SNI, option.SkipCertVerify, option.Fingerprint,
+			option.Certificate, option.PrivateKey, option.ClientFingerprint,
+			option.ALPN, t.echConfig, t.realityConfig,
+		)
+		if err != nil {
+			return nil, err
+		}
+		t.splitHTTPTransport = transport
 	}
 
 	return t, nil

@@ -1,4 +1,4 @@
-package vmess
+package websocket
 
 import (
 	"bufio"
@@ -19,7 +19,7 @@ import (
 	"github.com/metacubex/mihomo/common/buf"
 	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/component/ech"
-	tlsC "github.com/metacubex/mihomo/component/tls"
+	shareTLS "github.com/metacubex/mihomo/component/transport/tls"
 	"github.com/metacubex/mihomo/log"
 
 	"github.com/gobwas/ws"
@@ -45,10 +45,10 @@ type websocketWithEarlyDataConn struct {
 	dialed   chan bool
 	cancel   context.CancelFunc
 	ctx      context.Context
-	config   *WebsocketConfig
+	config   *Config
 }
 
-type WebsocketConfig struct {
+type Config struct {
 	Host                     string
 	Port                     string
 	Path                     string
@@ -295,22 +295,11 @@ func (wsedc *websocketWithEarlyDataConn) Upstream() any {
 	return wsedc.underlay
 }
 
-//func (wsedc *websocketWithEarlyDataConn) LazyHeadroom() bool {
-//	return wsedc.Conn == nil
-//}
-//
-//func (wsedc *websocketWithEarlyDataConn) Upstream() any {
-//	if wsedc.Conn == nil { // ensure return a nil interface not an interface with nil value
-//		return nil
-//	}
-//	return wsedc.Conn
-//}
-
 func (wsedc *websocketWithEarlyDataConn) NeedHandshake() bool {
 	return wsedc.Conn == nil
 }
 
-func streamWebsocketWithEarlyDataConn(conn net.Conn, c *WebsocketConfig) (net.Conn, error) {
+func streamWebsocketWithEarlyDataConn(conn net.Conn, c *Config) (net.Conn, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	conn = &websocketWithEarlyDataConn{
 		dialed:   make(chan bool, 1),
@@ -325,7 +314,7 @@ func streamWebsocketWithEarlyDataConn(conn net.Conn, c *WebsocketConfig) (net.Co
 	return N.NewDeadlineConn(conn), nil
 }
 
-func streamWebsocketConn(ctx context.Context, conn net.Conn, c *WebsocketConfig, earlyData *bytes.Buffer) (_ net.Conn, err error) {
+func streamWebsocketConn(ctx context.Context, conn net.Conn, c *Config, earlyData *bytes.Buffer) (_ net.Conn, err error) {
 	u, err := url.Parse(c.Path)
 	if err != nil {
 		return nil, fmt.Errorf("parse url %s error: %w", c.Path, err)
@@ -344,41 +333,27 @@ func streamWebsocketConn(ctx context.Context, conn net.Conn, c *WebsocketConfig,
 
 	if c.TLS {
 		uri.Scheme = "wss"
-		config := c.TLSConfig
-		if config == nil { // The config cannot be nil
-			config = &tls.Config{NextProtos: []string{"http/1.1"}}
+		// 直接调用统一的 TLS 握手组件
+		tlsCfg := &shareTLS.Config{
+			Host:                       c.Host,
+			SkipCertVerify:             false,
+			ClientFingerprint:          c.ClientFingerprint,
+			ECH:                        c.ECHConfig,
+			NextProtos:                 []string{"http/1.1"},
+			PreferWebsocketFingerprint: true, // ✨ 显式开启
 		}
-		if config.ServerName == "" && !config.InsecureSkipVerify { // users must set either ServerName or InsecureSkipVerify in the config.
-			config = config.Clone()
-			config.ServerName = c.Host
+		if c.TLSConfig != nil {
+			tlsCfg.SkipCertVerify = c.TLSConfig.InsecureSkipVerify
+			tlsCfg.Host = c.TLSConfig.ServerName
+			if tlsCfg.Host == "" {
+				tlsCfg.Host = c.Host
+			}
 		}
 
-		if clientFingerprint, ok := tlsC.GetFingerprint(c.ClientFingerprint); ok {
-			tlsConfig := tlsC.UConfig(config)
-			err = c.ECHConfig.ClientHandleUTLS(ctx, tlsConfig)
-			if err != nil {
-				return nil, err
-			}
-			tlsConn := tlsC.UClient(conn, tlsConfig, clientFingerprint)
-			if err = tlsC.BuildWebsocketHandshakeState(tlsConn); err != nil {
-				return nil, fmt.Errorf("parse url %s error: %w", c.Path, err)
-			}
-			err = tlsConn.HandshakeContext(ctx)
-			if err != nil {
-				return nil, err
-			}
-			conn = tlsConn
-		} else {
-			err = c.ECHConfig.ClientHandle(ctx, config)
-			if err != nil {
-				return nil, err
-			}
-			tlsConn := tls.Client(conn, config)
-			err = tlsConn.HandshakeContext(ctx)
-			if err != nil {
-				return nil, err
-			}
-			conn = tlsConn
+		var err error
+		conn, err = shareTLS.StreamTLSConn(ctx, conn, tlsCfg)
+		if err != nil {
+			return nil, err
 		}
 	}
 
@@ -480,7 +455,7 @@ func streamWebsocketConn(ctx context.Context, conn net.Conn, c *WebsocketConfig,
 	return N.NewDeadlineConn(conn), nil
 }
 
-func StreamWebsocketConn(ctx context.Context, conn net.Conn, c *WebsocketConfig) (net.Conn, error) {
+func StreamConn(ctx context.Context, conn net.Conn, c *Config) (net.Conn, error) {
 	if u, err := url.Parse(c.Path); err == nil {
 		if q := u.Query(); q.Get("ed") != "" {
 			if ed, err := strconv.Atoi(q.Get("ed")); err == nil {
