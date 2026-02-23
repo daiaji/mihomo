@@ -96,7 +96,9 @@ func TestSplitHTTP_EndToEnd(t *testing.T) {
 				return net.Dial("tcp", host)
 			}
 
-			tw := NewTransport(dialFn, nil, nil, config, "", nil, nil)
+			// ✨ 修复点：NewTransport 现在需要 9 个参数。
+			// 参数列表：dialFn, lpFn, tlsCfg, cfg, fp, authCert, authKey, echCfg, realityCfg
+			tw := NewTransport(dialFn, nil, nil, config, "", "", "", nil, nil)
 			defer tw.Close()
 
 			// 执行拨号
