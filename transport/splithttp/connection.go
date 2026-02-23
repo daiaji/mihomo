@@ -14,10 +14,14 @@ import (
 
 type splitConn struct {
 	writer     io.WriteCloser
-	reader     io.ReadCloser // 修正：恢复为 io.ReadCloser 以支持 Close() 并适配 transport.go 的赋值
+	reader     io.ReadCloser
 	remoteAddr net.Addr
 	localAddr  net.Addr
 	onClose    func()
+
+	// ✨ 缓存包装后的接口，避免高频调用产生 GC 压力
+	exReader N.ExtendedReader
+	exWriter N.ExtendedWriter
 
 	waitHandshake func() error
 	handshakeOnce sync.Once
@@ -30,52 +34,71 @@ type splitConn struct {
 	writeTimer *time.Timer
 }
 
+// ensureEx 确保握手完成并初始化缓存的扩展接口
+func (c *splitConn) ensureEx() error {
+	c.handshakeOnce.Do(func() {
+		if c.waitHandshake != nil {
+			c.handshakeErr = c.waitHandshake()
+		}
+		if c.handshakeErr == nil {
+			// 在握手成功后，只包装一次
+			if c.reader != nil {
+				c.exReader = bufio.NewExtendedReader(c.reader)
+			}
+			if c.writer != nil {
+				c.exWriter = bufio.NewExtendedWriter(c.writer)
+			}
+		}
+	})
+	return c.handshakeErr
+}
+
 func (c *splitConn) Write(b []byte) (int, error) {
+	if err := c.ensureEx(); err != nil {
+		return 0, err
+	}
 	return c.writer.Write(b)
 }
 
 // WriteBuffer 实现 N.ExtendedConn 接口
 func (c *splitConn) WriteBuffer(buffer *buf.Buffer) error {
-	// 包装 writer 为 ExtendedWriter 并执行写入
-	return bufio.NewExtendedWriter(c.writer).WriteBuffer(buffer)
+	if err := c.ensureEx(); err != nil {
+		return err
+	}
+	if c.exWriter == nil {
+		return io.ErrClosedPipe
+	}
+	// ✨ 使用缓存的包装器执行写入
+	return c.exWriter.WriteBuffer(buffer)
 }
 
 func (c *splitConn) Read(b []byte) (int, error) {
-	c.handshakeOnce.Do(func() {
-		if c.waitHandshake != nil {
-			c.handshakeErr = c.waitHandshake()
-		}
-	})
-	if c.handshakeErr != nil {
-		return 0, c.handshakeErr
+	if err := c.ensureEx(); err != nil {
+		return 0, err
 	}
-
+	if c.reader == nil {
+		return 0, io.EOF
+	}
 	return c.reader.Read(b)
 }
 
-// ReadBuffer 实现 N.ExtendedConn 接口，解决主线 deadline.go 的读取优化
+// ReadBuffer 实现 N.ExtendedConn 接口，适配主线 deadline.go
 func (c *splitConn) ReadBuffer(buffer *buf.Buffer) error {
-	c.handshakeOnce.Do(func() {
-		if c.waitHandshake != nil {
-			c.handshakeErr = c.waitHandshake()
-		}
-	})
-	if c.handshakeErr != nil {
-		return c.handshakeErr
+	if err := c.ensureEx(); err != nil {
+		return err
 	}
-	if c.reader == nil {
+	if c.exReader == nil {
 		return io.EOF
 	}
-
-	// ✨ 核心适配：动态包装并调用，避免主线异步抢占导致的数据截断
-	return bufio.NewExtendedReader(c.reader).ReadBuffer(buffer)
+	// ✨ 使用缓存的包装器执行高效读取
+	return c.exReader.ReadBuffer(buffer)
 }
 
 // Upstream 适配
 func (c *splitConn) Upstream() any {
 	// ✨ 保持返回 nil。
-	// 这会阻止主线 deadline.go 的 pipeRead 协程直接抢夺底层 HTTP 流的数据，
-	// 从而修复 curl 出现的 unexpected eof 错误。
+	// 强制屏蔽主线 deadline.go 的异步预读协程，
+	// 这是解决 curl 报 unexpected eof 的核心逻辑。
 	return nil
 }
 
@@ -89,7 +112,7 @@ func (c *splitConn) Close() error {
 		c.stopTimer(false)
 		err1 = c.writer.Close()
 		if c.reader != nil {
-			err2 = c.reader.Close() // 现在正常了，因为类型是 io.ReadCloser
+			err2 = c.reader.Close()
 		}
 	})
 	if err1 != nil {
@@ -136,7 +159,6 @@ func (c *splitConn) SetReadDeadline(t time.Time) error {
 		return nil
 	}
 	c.readTimer = time.AfterFunc(time.Until(t), func() {
-		// 尝试使用接口关闭管道
 		if pr, ok := c.reader.(interface{ CloseWithError(error) error }); ok {
 			_ = pr.CloseWithError(os.ErrDeadlineExceeded)
 		}
@@ -162,5 +184,5 @@ func (c *splitConn) SetWriteDeadline(t time.Time) error {
 	return nil
 }
 
-// 确保 splitConn 完全实现了 N.ExtendedConn 接口
+// 确保完全实现了接口
 var _ N.ExtendedConn = (*splitConn)(nil)
