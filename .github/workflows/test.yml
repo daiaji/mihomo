@@ -7,11 +7,13 @@ on:
       - ".github/ISSUE_TEMPLATE/**"
     branches:
       - Alpha
+      - fixup
     tags:
       - "v*"
   pull_request:
     branches:
       - Alpha
+      - fixup
 
 jobs:
   test:
