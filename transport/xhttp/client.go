@@ -1,7 +1,6 @@
 package xhttp
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -16,6 +15,7 @@ import (
 
 	"github.com/metacubex/mihomo/common/contextutils"
 	"github.com/metacubex/mihomo/common/httputils"
+	"github.com/metacubex/mihomo/common/pool"
 
 	"github.com/metacubex/http"
 	"github.com/metacubex/http/httptrace"
@@ -53,6 +53,7 @@ type PacketUpWriter struct {
 	seq                  uint64
 	buf                  []byte
 	timer                *time.Timer
+	isTimerActive        bool
 	flushErr             error
 }
 
@@ -64,47 +65,94 @@ func (c *PacketUpWriter) Write(b []byte) (int, error) {
 		return 0, err
 	}
 
-	data := bytes.NewBuffer(b)
-	for data.Len() > 0 {
-		if c.timer == nil { // start a timer to flush the buffer
-			c.timer = time.AfterFunc(time.Duration(c.scMinPostsIntervalMs.Rand())*time.Millisecond, c.flush)
+	totalWritten := len(b)
+	for len(b) > 0 {
+		if c.timer == nil {
+			c.timer = time.NewTimer(time.Hour)
+			c.timer.Stop()
+			go func() {
+				for {
+					select {
+					case <-c.timer.C:
+						c.flush()
+					case <-c.ctx.Done():
+						return
+					}
+				}
+			}()
 		}
 
-		c.buf = append(c.buf, data.Next(c.scMaxEachPostBytes-len(c.buf))...) // let buffer fill up to scMaxEachPostBytes
+		if c.buf == nil {
+			// Get the maximum possible length buffer from the pool, but truncate the length to 0 for easy append/copy
+			c.buf = pool.Get(c.scMaxEachPostBytes)[:0]
+		}
 
-		if len(c.buf) >= c.scMaxEachPostBytes { // too much data in buffer, wait the flush complete
+		// Calculate how many bytes can be copied this time without triggering allocation
+		remain := c.scMaxEachPostBytes - len(c.buf)
+		n := copy(c.buf[len(c.buf):cap(c.buf)], b)
+		if n > remain {
+			n = remain
+		}
+
+		c.buf = c.buf[:len(c.buf)+n]
+		b = b[n:]
+
+		if !c.isTimerActive && len(c.buf) > 0 {
+			c.timer.Reset(time.Duration(c.scMinPostsIntervalMs.Rand()) * time.Millisecond)
+			c.isTimerActive = true
+		}
+
+		if len(c.buf) >= c.scMaxEachPostBytes {
+			c.flushLocked()
+		}
+
+		if len(b) > 0 && c.buf != nil && len(c.buf) >= c.scMaxEachPostBytes {
+			// Buffer is full, must wait for flush to complete
 			c.writeCond.Wait()
 			if err := c.flushErr; err != nil {
-				return 0, err
+				return totalWritten - len(b), err
 			}
 		}
 	}
-	return len(b), nil
+	return totalWritten, nil
 }
 
 func (c *PacketUpWriter) flush() {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
+	c.flushLocked()
+}
 
-	defer c.writeCond.Broadcast() // wake up the waited Write() call
-
-	if c.timer != nil {
-		c.timer.Stop()
-		c.timer = nil
+func (c *PacketUpWriter) flushLocked() {
+	if c.isTimerActive {
+		if !c.timer.Stop() {
+			select {
+			case <-c.timer.C:
+			default:
+			}
+		}
+		c.isTimerActive = false
 	}
 
-	if c.flushErr != nil {
+	if c.flushErr != nil || len(c.buf) == 0 {
 		return
 	}
 
-	if len(c.buf) == 0 {
-		return
+	defer c.writeCond.Broadcast()
+
+	buf := c.buf
+	c.buf = nil
+
+	// Here write will internally call FillPacketRequest, and finally send data
+	_, err := c.write(buf)
+
+	// Transmission completed, return memory immediately
+	if buf != nil {
+		_ = pool.Put(buf)
 	}
-	_, err := c.write(c.buf)
-	c.buf = c.buf[:0] // reset buffer
+
 	if err != nil {
 		c.flushErr = err
-		return
 	}
 }
 
@@ -132,8 +180,7 @@ func (c *PacketUpWriter) write(b []byte) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, resp.Body)
+	go drainAndCloseBody(resp.Body)
 
 	if resp.StatusCode != http.StatusOK {
 		return 0, fmt.Errorf("xhttp packet-up bad status: %s", resp.Status)
@@ -535,8 +582,7 @@ func (c *Client) DialStreamUp(ctx context.Context) (net.Conn, error) {
 			_ = pw.CloseWithError(err)
 			return
 		}
-		defer resp.Body.Close()
-		_, _ = io.Copy(io.Discard, resp.Body)
+		go drainAndCloseBody(resp.Body)
 
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			_ = pw.CloseWithError(fmt.Errorf("xhttp stream-up upload bad status: %s", resp.Status))

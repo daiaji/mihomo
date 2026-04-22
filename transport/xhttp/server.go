@@ -13,6 +13,7 @@ import (
 
 	"github.com/metacubex/mihomo/common/httputils"
 	N "github.com/metacubex/mihomo/common/net"
+	"github.com/metacubex/mihomo/common/pool"
 
 	"github.com/metacubex/http"
 	"github.com/metacubex/http/h2c"
@@ -180,12 +181,6 @@ func (h *requestHandler) deleteSession(sessionID string) {
 	}
 }
 
-func (h *requestHandler) getSession(sessionID string) *httpSession {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return h.sessions[sessionID]
-}
-
 func (h *requestHandler) normalizedMode() string {
 	if h.config.Mode == "" {
 		return "auto"
@@ -227,6 +222,48 @@ func (h *requestHandler) allowPacketUpUpload() bool {
 	default:
 		return false
 	}
+}
+
+func (h *requestHandler) decodeMetadataToBuffer(r *http.Request, key string, isCookie bool) ([]byte, error) {
+	totalEncodedLen := 0
+	type chunk struct {
+		val string
+	}
+	var chunks []chunk
+	for i := 0; ; i++ {
+		var encoded string
+		if isCookie {
+			cookieName := fmt.Sprintf("%s_%d", key, i)
+			if c, _ := r.Cookie(cookieName); c != nil {
+				encoded = c.Value
+			}
+		} else {
+			encoded = r.Header.Get(fmt.Sprintf("%s-%d", key, i))
+		}
+
+		if encoded == "" {
+			break
+		}
+		totalEncodedLen += len(encoded)
+		chunks = append(chunks, chunk{val: encoded})
+	}
+
+	if totalEncodedLen == 0 {
+		return nil, nil
+	}
+
+	decLen := base64.RawURLEncoding.DecodedLen(totalEncodedLen)
+	target := pool.Get(decLen)
+	offset := 0
+	for _, c := range chunks {
+		n, err := base64.RawURLEncoding.Decode(target[offset:], []byte(c.val))
+		if err != nil {
+			_ = pool.Put(target)
+			return nil, err
+		}
+		offset += n
+	}
+	return target[:offset], nil
 }
 
 func (h *requestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -334,99 +371,7 @@ func (h *requestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// packet-up upload: POST /path/{session}/{seq}
 	if r.Method != http.MethodGet && sessionId != "" && seqStr != "" && h.allowPacketUpUpload() {
-		scMaxEachPostBytes := h.scMaxEachPostBytes.Max
-		dataPlacement := h.config.GetNormalizedUplinkDataPlacement()
-		uplinkDataKey := h.config.UplinkDataKey
-		var headerPayload []byte
-		var err error
-		if dataPlacement == PlacementAuto || dataPlacement == PlacementHeader {
-			var headerPayloadChunks []string
-			for i := 0; true; i++ {
-				chunk := r.Header.Get(fmt.Sprintf("%s-%d", uplinkDataKey, i))
-				if chunk == "" {
-					break
-				}
-				headerPayloadChunks = append(headerPayloadChunks, chunk)
-			}
-			headerPayloadEncoded := strings.Join(headerPayloadChunks, "")
-			headerPayload, err = base64.RawURLEncoding.DecodeString(headerPayloadEncoded)
-			if err != nil {
-				http.Error(w, "invalid base64 in header's payload", http.StatusBadRequest)
-				return
-			}
-		}
-
-		var cookiePayload []byte
-		if dataPlacement == PlacementAuto || dataPlacement == PlacementCookie {
-			var cookiePayloadChunks []string
-			for i := 0; true; i++ {
-				cookieName := fmt.Sprintf("%s_%d", uplinkDataKey, i)
-				if c, _ := r.Cookie(cookieName); c != nil {
-					cookiePayloadChunks = append(cookiePayloadChunks, c.Value)
-				} else {
-					break
-				}
-			}
-			cookiePayloadEncoded := strings.Join(cookiePayloadChunks, "")
-			cookiePayload, err = base64.RawURLEncoding.DecodeString(cookiePayloadEncoded)
-			if err != nil {
-				http.Error(w, "invalid base64 in cookies' payload", http.StatusBadRequest)
-				return
-			}
-		}
-
-		var bodyPayload []byte
-		if dataPlacement == PlacementAuto || dataPlacement == PlacementBody {
-			if r.ContentLength > int64(scMaxEachPostBytes) {
-				http.Error(w, "body too large", http.StatusRequestEntityTooLarge)
-				return
-			}
-			bodyPayload, err = io.ReadAll(io.LimitReader(r.Body, int64(scMaxEachPostBytes)+1))
-			if err != nil {
-				http.Error(w, "failed to read body", http.StatusBadRequest)
-				return
-			}
-		}
-
-		var payload []byte
-		switch dataPlacement {
-		case PlacementHeader:
-			payload = headerPayload
-		case PlacementCookie:
-			payload = cookiePayload
-		case PlacementBody:
-			payload = bodyPayload
-		case PlacementAuto:
-			payload = headerPayload
-			payload = append(payload, cookiePayload...)
-			payload = append(payload, bodyPayload...)
-		}
-
-		if len(payload) > h.scMaxEachPostBytes.Max {
-			http.Error(w, "body too large", http.StatusRequestEntityTooLarge)
-			return
-		}
-
-		seq, err := strconv.ParseUint(seqStr, 10, 64)
-		if err != nil {
-			http.Error(w, "invalid xhttp seq", http.StatusBadRequest)
-			return
-		}
-
-		err = currentSession.uploadQueue.Push(Packet{
-			Seq:     seq,
-			Payload: payload,
-		})
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		if len(payload) == 0 {
-			// Methods without a body are usually cached by default.
-			w.Header().Set("Cache-Control", "no-store")
-		}
-		w.WriteHeader(http.StatusOK)
+		h.handlePacketUp(w, r, currentSession, seqStr)
 		return
 	}
 
@@ -502,15 +447,109 @@ func (h *requestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	http.NotFound(w, r)
 }
 
-func splitNonEmpty(s string) []string {
-	raw := strings.Split(s, "/")
-	out := make([]string, 0, len(raw))
-	for _, v := range raw {
-		if v != "" {
-			out = append(out, v)
+func (h *requestHandler) handlePacketUp(w http.ResponseWriter, r *http.Request, currentSession *httpSession, seqStr string) {
+	dataPlacement := h.config.GetNormalizedUplinkDataPlacement()
+	uplinkDataKey := h.config.UplinkDataKey
+	maxSize := h.scMaxEachPostBytes.Max
+
+	var headerPayload, cookiePayload, bodyPayload []byte
+	var err error
+
+	// 1 & 2. Header/Cookie
+	if dataPlacement == PlacementAuto || dataPlacement == PlacementHeader {
+		headerPayload, _ = h.decodeMetadataToBuffer(r, uplinkDataKey, false)
+	}
+	if dataPlacement == PlacementAuto || dataPlacement == PlacementCookie {
+		cookiePayload, _ = h.decodeMetadataToBuffer(r, uplinkDataKey, true)
+	}
+
+	// 3. Handle Body: completely abolish io.ReadAll
+	if dataPlacement == PlacementAuto || dataPlacement == PlacementBody {
+		cl := int(r.ContentLength)
+		if cl > maxSize {
+			h.releaseAll(headerPayload, cookiePayload, nil)
+			http.Error(w, "body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
+
+		if cl > 0 {
+			bodyPayload = pool.Get(cl)
+			_, err = io.ReadFull(r.Body, bodyPayload)
+		} else if cl < 0 {
+			// Chunked transfer: use LimitReader with pooled buffer
+			tempBuf := pool.Get(maxSize)
+			n, rerr := io.ReadFull(io.LimitReader(r.Body, int64(maxSize)), tempBuf)
+			if rerr != nil && rerr != io.EOF && rerr != io.ErrUnexpectedEOF {
+				_ = pool.Put(tempBuf)
+				h.releaseAll(headerPayload, cookiePayload, nil)
+				http.Error(w, "read chunked body failed", http.StatusBadRequest)
+				return
+			}
+			bodyPayload = tempBuf[:n]
+		}
+		if err != nil {
+			h.releaseAll(headerPayload, cookiePayload, bodyPayload)
+			http.Error(w, "read body failed", http.StatusBadRequest)
+			return
 		}
 	}
-	return out
+
+	// 4. Merge Payload: avoid redundant allocations
+	var finalPayload []byte
+	if dataPlacement == PlacementAuto {
+		totalSize := len(headerPayload) + len(cookiePayload) + len(bodyPayload)
+		if totalSize > maxSize {
+			h.releaseAll(headerPayload, cookiePayload, bodyPayload)
+			http.Error(w, "total payload too large", http.StatusRequestEntityTooLarge)
+			return
+		}
+		if totalSize > 0 {
+			finalPayload = pool.Get(totalSize)
+			n := copy(finalPayload, headerPayload)
+			n += copy(finalPayload[n:], cookiePayload)
+			copy(finalPayload[n:], bodyPayload)
+		}
+		h.releaseAll(headerPayload, cookiePayload, bodyPayload) // Release fragments
+	} else {
+		// Assign directly
+		switch dataPlacement {
+		case PlacementHeader:
+			finalPayload = headerPayload
+		case PlacementCookie:
+			finalPayload = cookiePayload
+		case PlacementBody:
+			finalPayload = bodyPayload
+		}
+	}
+
+	// 5. Submit to queue
+	seq, _ := strconv.ParseUint(seqStr, 10, 64)
+	if err := currentSession.uploadQueue.Push(Packet{Seq: seq, Payload: finalPayload}); err != nil {
+		if finalPayload != nil {
+			_ = pool.Put(finalPayload)
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	if len(finalPayload) == 0 {
+		// Methods without a body are usually cached by default.
+		w.Header().Set("Cache-Control", "no-store")
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+// Auxiliary release function
+func (h *requestHandler) releaseAll(p1, p2, p3 []byte) {
+	if p1 != nil {
+		_ = pool.Put(p1)
+	}
+	if p2 != nil {
+		_ = pool.Put(p2)
+	}
+	if p3 != nil {
+		_ = pool.Put(p3)
+	}
 }
 
 func equalHost(a, b string) bool {
